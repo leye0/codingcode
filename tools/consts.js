@@ -1,0 +1,2 @@
+export const commonCommentStartInDifferentLanguages = ['//', '#'];
+export const unachieverHints = ['...', 'previous', 'before', 'the same', 'existing', 'rest of the', 'remain', 'of the logic', 'unchanged', 'code'];
