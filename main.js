@@ -1,5 +1,5 @@
 // @ts-check
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { NodeHtmlMarkdown } from 'node-html-markdown';
 import * as path from 'path';
 import {
@@ -16,16 +16,15 @@ import {
     setSessionAction,
     setSessionWorkspace,
     setSessionTokens,
+    findReferencesToPreviousCode,
 } from './tools';
-import { parseCommands } from './commands';
 import { join } from 'path';
 import * as rl from 'node:readline';
 import * as dotenv from 'dotenv';
 import { getChatCompletion } from './tools/open-ai-chat-completion';
-import { CleanMessages } from './tools/message-cleaning';
 import { Color } from './tools/colors';
-import { findReferenceToPreviousCode as findReferencesToPreviousCode, repairFile } from './tools/repair-file';
 import { codeRebuilder } from './tools/code-rebuilder';
+import { deleteFolderRecursive } from './tools/delete-folder';
 
 async function main() {
     dotenv.config();
@@ -44,8 +43,6 @@ async function main() {
         output: process.stdout,
     });
 
-    const commander = readFileSync('./commands.txt', 'utf8');
-
     let sessionId = new Date().getTime();
     const session = []; // array of message array, to remember everything that is sent, because message cleanup/filtering will happen (step 4)
     let requirements = '';
@@ -55,8 +52,12 @@ async function main() {
     ];
     let messagesThatCanBeDiscarded = [];
 
+    const allWorkspacesDirectory = path.join(process.cwd(), 'workspaces');
+
     const workspaceName = await ask(readLineInterface, 'Project name [filename without spaces]? ');
     setSessionWorkspace(workspaceName, sessionContext);
+    const sessionPath = allWorkspacesDirectory + '/' + workspaceName + '-' + sessionId + '.log'
+    const workspaceDirectory = path.join(allWorkspacesDirectory, workspaceName);
 
     if (!existsSync('./workspaces')) {
         mkdirSync('workspaces');
@@ -67,11 +68,16 @@ async function main() {
         const toContinue = await ask(readLineInterface, 'Continue existing project (yes or no)? ');
         if (toContinue.indexOf('y') === 0) {
             continuing = true;
+        } else {
+            deleteFolderRecursive(path.join(allWorkspacesDirectory, workspaceName));
+            const sessionFile = readdirSync(allWorkspacesDirectory).find(f => path.basename(f).indexOf(workspaceName + '-') === 0);
+            if (sessionFile) {
+                unlinkSync(path.join(allWorkspacesDirectory, sessionFile));
+            }
+            mkdirSync(join('workspaces', workspaceName));
         }
     }
 
-    const allWorkspacesDirectory = path.join(process.cwd(), 'workspaces');
-    const workspaceDirectory = path.join(allWorkspacesDirectory, workspaceName);
     process.chdir(workspaceDirectory);
 
     function write(path, content) {
@@ -91,27 +97,29 @@ async function main() {
 
     async function createChatCompletion(messages) {
         try {
-            let isComplete = false;
-            while (!isComplete) {
-                const response = await getChatCompletion(messages);
-                currentResult += response.data.choices[0].message.content;
-                addMessage('assistant', response.data.choices[0].message.content);
-                isComplete = response.data.choices[0].finish_reason === 'stop';
-                const currentTokens = response.data.usage.total_tokens;
-                setSessionTokens(currentTokens, sessionContext)
-            }
+            // let isComplete = false;
+            // while (!isComplete) {
+            const response = await getChatCompletion(messages, 'gpt-4-0613', true);
+            // currentResult += response.data.choices[0].message.function_call;
+            const functionCall = response.data.choices[0].message.function_call;
+
+            // isComplete = response.data.choices[0].finish_reason === 'function_call';
+            // Here I naively take for grant there will be no "content" message.
+            const currentTokens = response.data.usage.total_tokens;
+            setSessionTokens(currentTokens, sessionContext)
+            // }
 
             retries = 0;
 
-            if (currentResult) {
-                const message = currentResult;
-                currentResult = '';
-                const commandsFound = parseCommands(message);
-                const cmdFound = await applyCommands(commandsFound);
-                if (cmdFound.length == 1 && cmdFound[0].name === '/REASONING_COMMAND') {
-                    addMessage('user', 'You need to execute something using one of the commanders. Use a commander other than /REASONING_COMMAND for your next mssage so you will execute something!');
-                }
+            // if (result) {
+            // const message = result;
+            // result = '';
+            // await applyCommands(message);
+            if (functionCall) {
+                await applyCommands(functionCall);
             }
+
+            // }
 
         } catch (error) {
             let gptError = error?.response?.data?.error ?? error?.response?.data ?? error?.response;
@@ -167,164 +175,134 @@ async function main() {
         messages.push(message);
     }
 
-    async function applyCommands(cmdFound) {
-        for (let cmd of cmdFound) {
-            if (cmd.name === '/SEARCH_COMMAND') {
-                const query = cmd.parameters.join(' ');
-                console.log('Google search query: ', query);
-                const results = await searchGoogle(query);
-                if (results.length === 0) {
-                    addMessage('user', 'There is no results on Google for this query');
-                } else {
-                    addMessage('user', 'Results are: \n\n' + JSON.stringify(results, null, 4) + '\n\Use the BROWSE_COMMAND {url} to open and read one of the result by specifying the exact url in the result that interests you.');
+    async function applyCommands(functionCall) {
+        const name = functionCall.name;
+        const args = JSON.parse(functionCall.arguments);
+
+        setSessionAction(args.reason, sessionContext);
+
+        if (name === 'SEARCH_COMMAND') {
+            console.log('Google search query: ', args.query);
+            const results = await searchGoogle(args.query);
+            if (results.length === 0) {
+                addMessage('user', 'There is no results on Google for this query');
+            } else {
+                addMessage('user', 'Results are: \n\n' + JSON.stringify(results, null, 4) + '\n\Use the BROWSE_COMMAND {url} to open and read one of the result by specifying the exact url in the result that interests you.');
+            }
+        }
+
+        if (name === 'BROWSE_COMMAND') {
+            const content = await getPageContent(args.url);
+            const markdown = NodeHtmlMarkdown.translate(content);
+
+            // GPT-3 stuff:
+            const cleanPrompt = 'Cleanup the following text to only keep information and remove repetitive links or useless stuff:\n' + markdown;
+            const cleanMessages = [{ role: 'user', content: cleanPrompt }];
+            const cleanResult = await getChatCompletion(cleanMessages);
+            let cleanMarkdown = JSON.stringify(cleanResult.data.choices[0].message.content);
+            addMessage('user', 'Web page content is:\n' + cleanMarkdown)
+        }
+
+        if (name === 'DIR_COMMAND') {
+            const projectFileStructure = await dir(workspaceDirectory);
+            addMessage('user', `Here is the full file structure of the project, starting from project root.\n\n${projectFileStructure}\n\nYou are currently in the folder: ${process.cwd()}`);
+        }
+
+        if (name === 'WRITE_COMMAND') {
+            let writeRetries = 0;
+            while (true) {
+                const fileExists = existsSync(args.path);
+                // TODO: re-implement
+                // const forgotToReadBefore = fileExists && !messages.some((m) => m.content.indexOf(`READ_COMMAND ${path}`));
+                const previousFileContent = fileExists ? await readFileContent(args.path, workspaceDirectory) : undefined;
+                let nextFileContent = args.file_content.replace(/```js/g, '');
+                nextFileContent = nextFileContent.replace(/```javascript/g, '');
+                nextFileContent = nextFileContent.replace(/```html/g, '');
+                nextFileContent = nextFileContent.replace(/```/g, '');
+
+                // First check: try to repair the file if there are any regression.
+                const referencesToPreviousCode = findReferencesToPreviousCode(nextFileContent); // If there are still bad coder lines (reference to old code), which is unlikely to happen, then we will act upon it.
+
+                // TODO: Replace by a new thread of GPT-4 (or even GPT-3.5 16k with all files then instructions).
+                if (referencesToPreviousCode.length) {
+                    console.log('Warning: Code has been rebuilt from a merge between previous file and incomplete GPT.');
+                    nextFileContent = await codeRebuilder(previousFileContent, nextFileContent);
                 }
-            }
 
-            if (cmd.name === '/BROWSE_COMMAND') {
-                const url = cmd.parameters[0];
-                const content = await getPageContent(url);
-                const markdown = NodeHtmlMarkdown.translate(content);
-
-                // TODO: We'll need to orientate the cleanup based on the current task once this is integrated.
-                const cleanPrompt = 'Cleanup the following text to only keep information and remove repetitive links or useless stuff:\n' + markdown;
-                const cleanMessages = [{ role: 'user', content: cleanPrompt }];
-                const cleanResult = await getChatCompletion(cleanMessages);
-                let cleanMarkdown = JSON.stringify(cleanResult.data.choices[0].message.content);
-                addMessage('user', 'Web page content is:\n' + cleanMarkdown)
-            }
-
-            if (cmd.name === '/DIR_COMMAND') {
-                const projectFileStructure = await dir(workspaceDirectory);
-                addMessage('user', 'Here is the full file structure of the project, starting from project root.');
-                addMessage('user', projectFileStructure);
-                addMessage('user', 'You are currently in the folder: ' + process.cwd());
-            }
-
-            if (cmd.name === '/REASONING_COMMAND') {
-                let reasoning = cmd.parameters.join(' ');
-                setSessionWorkspace(workspaceName, sessionContext);
-                setSessionAction(reasoning, sessionContext);
-            }
-
-            if (cmd.name === '/WRITE_COMMAND') {
-                let path = cmd.parameters[0].trim();
-
-                // To test better: Some cleanup here. Probably that duplicates are fileread are useless at that moment, as well as error about files not found.
-                messages = CleanMessages.removeFileNotFoundErrors(messages);
-
-                // If 
-                messages = CleanMessages.removeGoogleSearchResults(messages)
-
-                const fileExists = existsSync(path);
-                const forgotToReadBefore = fileExists && !messages.some((m) => m.content.indexOf(`/READ_COMMAND ${path}`));
-                const previousFileContent = fileExists ? await readFileContent(path, workspaceDirectory) : undefined;
-
-                if (forgotToReadBefore) {
-                    addMessage('user', `Always read the files before writing them. The content is:\n${previousFileContent}`);
-                } else {
-                    let nextFileContent = cmd.content.replace(/```js/g, '');
-                    nextFileContent = nextFileContent.replace(/```javascript/g, '');
-                    nextFileContent = nextFileContent.replace(/```html/g, '');
-                    nextFileContent = nextFileContent.replace(/```/g, '');
-
-                    // First check: try to repair the file if there are any regression.
-                    const referencesToPreviousCode = findReferencesToPreviousCode(nextFileContent); // If there are still bad coder lines (reference to old code), which is unlikely to happen, then we will act upon it.
-
-                    // Sadly, it is not perfect enough to be used yet as separation between hunks are not working.
-
-                    // if (previousFileContent && referencesToPreviousCode.length) {
-                    //     console.log('previous content:\n\n', previousFileContent, '\n\nnext content:\n\n', nextFileContent);
-                    //     nextFileContent = repairFile(previousFileContent, nextFileContent);
-                    //     console.log('\n\nrepaired content:\n\n', nextFileContent);
-                    // }
-
-                    // Will fallback to old method:
-                    // TODO: Replace by a new thread of GPT-4 (or even GPT-3.5 16k with all files then instructions).
-                    if (referencesToPreviousCode.length) {
-                        const rebuiltCode = await codeRebuilder(previousFileContent, nextFileContent);
-                        console.log('rebuilt!!! ', rebuiltCode);
-                        const mergedFileContent = await readFileContent(path, workspaceDirectory);
-                        const writeIsOk = write(path, mergedFileContent); // Write is ok should be used to check if the writing process was ok 
-                        CleanMessages.removeDuplicateFileRead(messages, path, 0);
-                        addMessage('user', `Your changes have been merged into the existing files. Here is the new content:\n\nfile:${path}\n\n${mergedFileContent}`);
-                    } else {
-                        const findUnimplementedCode = await getChatCompletion([{ role: 'user', content: `Here is a code. Make a numbered list of all places where the code indicates that there is unimplemented or missing code that need to be written. If it is OK, just write "OK" as your answer.\n\n${nextFileContent}` }]);
-                        if (findUnimplementedCode.data.choices[0].message.content.toLowerCase().indexOf('ok') < 0) {
-                            messages = CleanMessages.removeDuplicateFileRead(messages, path, 1); // Keep the last version, and the previous version for reference.
-                            addMessage('user', `Revise the file you just wrote. It seems that either you did not implement everything or you removed some parts. Please implement everything listed. If everything you can implement is implemented or you need to implement it later, then do it later. If you are totally done with the whole project, then use the /DONE_COMMAND. Here are the problematic detect parts:\n\n${findUnimplementedCode.data.choices[0].message.content}`);
-                        } else {
-                            const writeIsOk = write(path, nextFileContent); // Write is ok should be used to check if the writing process was ok 
-                            messages = CleanMessages.removeDuplicateFileRead(messages, path, 1); // Finally written a file we are ok with. Keep only that one!
-                        }
-                    }
-                }
-            }
-
-            if (cmd.name === '/READ_COMMAND') {
-                let path = cmd.parameters[0].trim();
-                const fileContent = await readFileContent(path, workspaceDirectory);
-                addMessage('user', fileContent);
-            }
-
-            if (cmd.name === '/FINDIMAGE_COMMAND') {
-                const width = cmd.parameters[0];
-                const height = cmd.parameters[1];
-                const path = cmd.parameters[2];
-                const prompt = cmd.parameters.slice(3).join(' ');
-
-                // TODO: Currently testing in fire-and-forget mode. If it doesn't work well, it can be refactored to be awaited.
-                findImage(prompt, path, width, height).then((ok) => {
-                    if (ok) {
-                        addMessage('user', `image ${prompt} written at ${path}`);
-                    } else {
-                        addMessage('user', `image ${prompt} could not be found on DALL-E or written at ${path}`);
-                    }
-                });
-            }
-
-            if (cmd.name === '/ASK_COMMAND') {
-                const assistantQuestion = cmd.parameters.join(' ');
-                const responseToAssistantQuestion = await ask(readLineInterface, `The assistant is asking you this question:\n${assistantQuestion}`);
-                addMessage('user', responseToAssistantQuestion);
-            }
-
-            if (cmd.name === '/RENAME_COMMAND') {
-                const oldPath = cmd.parameters[0];
-                const newPath = cmd.parameters[1];
-                await renameFile(oldPath, newPath);
-            }
-
-            if (cmd.name === '/CMD_COMMAND') {
                 try {
-                    try {
-                        await runShellCommand(cmd.parameters.join(' '), addMessage), sessionContext;
-                    } catch (err) {
-                        console.log(err);
-                        // TODO: Don't know why yet but the error in the runShellCommand is crashing the app.
+                    const findUnimplementedCode = await getChatCompletion([{ role: 'user', content: `Here is a code. Make a numbered list of all places where the code indicates that there is unimplemented or missing code that need to be written. If it is OK, just write "OK" as your answer.\n\n${nextFileContent}` }]);
+                    if (findUnimplementedCode.data.choices[0].message.content.toLowerCase().indexOf('ok') < 0) {
+                        addMessage('user', `Revise the file you just wrote. It seems that either you did not implement everything or you removed some parts. Please implement everything listed. If everything you can implement is implemented or you need to implement it later, then do it later. If you are totally done with the whole project, then use the DONE_COMMAND. Here is the file:\n\n${nextFileContent}\n\nHere are the problematic detect parts:\n\n${findUnimplementedCode.data.choices[0].message.content}`);
+                    } else {
+                        write(args.path, nextFileContent); // Write is ok should be used to check if the writing process was ok 
+                        addMessage('user', `Ok. You are done with step: "${args.reason}". File ${args.path} written with content:\n\n${nextFileContent}\n\nContinue to next step.`);
+                        break; // Stop loops
                     }
-
-                } catch (err) {
-                    const projectFileStructure = await dir(workspaceDirectory);
-                    addMessage('user', 'Error when running command: ' + err);
-                    addMessage('user', 'Please note that the command was executed in this folder: ' + process.cwd() + ' The current project file structure is:\n\n' + projectFileStructure);
-
-                    // If it was not intented to be executed in this folder, please change the folder accordingly.');
-                }
-                setSessionAction('Ready.', sessionContext);
-            }
-
-            if (cmd.name === '/DONE_COMMAND') {
-                const improvements = await ask(readLineInterface, 'Agent is done. AT USER: Any improvements to bring on the final result? Take the time to review the result and write improvements to do here. ');
-                if (improvements) {
-                    addMessage('user', improvements + ' Once you are done with that, launch the /DONE_COMMAND.');
-                } else {
-                    console.log('Finished.');
-                    process.exit(0);
+                } catch (error) {
+                    writeRetries++;
+                    if (writeRetries > 2) {
+                        console.log('Could not write file. Trying to continue with the rest.');
+                        break;
+                        return;
+                    }
+                    console.log('Some GPT calls to write file failed')
+                    await sleep(15000);
                 }
             }
         }
 
-        return cmdFound;
+        if (name === 'READ_COMMAND') {
+            const fileContent = await readFileContent(args.path, workspaceDirectory);
+            addMessage('user', fileContent);
+        }
+
+        if (name === 'FINDIMAGE_COMMAND') {
+            findImage(args.description, args.path, args.image_width, args.image_height).then((ok) => {
+                if (ok) {
+                    addMessage('user', `image ${prompt} written at ${args.path}`);
+                } else {
+                    addMessage('user', `image ${prompt} could not be found on DALL-E or written at ${args.path}`);
+                }
+            });
+        }
+
+        if (name === 'ASK_COMMAND') {
+            const responseToAssistantQuestion = await ask(readLineInterface, `The assistant is asking you this question:\n${args.question}`);
+            addMessage('user', responseToAssistantQuestion);
+        }
+
+        if (name === 'RENAME_COMMAND') {
+            await renameFile(args.old_path, args.new_path);
+        }
+
+        if (name === 'CMD_COMMAND') {
+            try {
+                try {
+                    await runShellCommand(args.command, addMessage), sessionContext;
+                } catch (err) {
+                    console.log(err);
+                    // TODO: Don't know why yet but some errors in the runShellCommand are crashing the app.
+                }
+
+            } catch (err) {
+                const projectFileStructure = await dir(workspaceDirectory);
+                addMessage('user', 'Error when running command: ' + err);
+                addMessage('user', 'Please note that the command was executed in this folder: ' + process.cwd() + ' The current project file structure is:\n\n' + projectFileStructure);
+
+                // If it was not intented to be executed in this folder, please change the folder accordingly.');
+            }
+            setSessionAction('Ready.', sessionContext);
+        }
+
+        if (name === 'DONE_COMMAND') {
+            const improvements = await ask(readLineInterface, 'Agent is done. AT USER: Any improvements to bring on the final result? Take the time to review the result and write improvements to do here. ');
+            if (improvements) {
+                addMessage('user', improvements + ' Once you are done with that, launch the DONE_COMMAND.');
+            } else {
+                console.log('Finished.');
+                process.exit(0);
+            }
+        }
     }
 
     setSessionAction('Ready.', sessionContext);
@@ -335,6 +313,7 @@ async function main() {
             // Initializing project
 
             const projectDescription = await ask(readLineInterface, '\nWhat do you want to develop? Describe it in details because there is no telepathy between you and the GPT model, and GPT does not always -really- know: ');
+            console.log('');
 
             const requirementPrompt = `You will do the following: ${projectDescription}\n\nI want you to display how you would achieve this goal perfectly by breaking it into multiple steps. Each step should contain only one step and/or command. Only one thing to do or execute. List them as:\n1. [description of the step]\n2. [ description of the step]\netc.`;
             const initialMessages = [{ role: 'user', content: requirementPrompt }];
@@ -344,10 +323,13 @@ async function main() {
             requirements = initialResponse.data.choices[0].message.content;
             // TODO: Make it write requirements as it is written by a machine, with its limitations.
             console.log('Requirements are:\n\n' + requirements);
+            console.log('');
 
-            const stepsToExclude = await ask(readLineInterface, '\nAre there steps you want to exclude? List them or leave it blank: ');
+            const stepsToExclude = await ask(readLineInterface, 'Are there steps you want to exclude? List them or leave it blank: ');
+            console.log('');
 
-            const stepsToInclude = await ask(readLineInterface, '\nAre there steps missing that you want to include (i.e. 1. Install xyz) ? List them or leave it blank: ');
+            const stepsToInclude = await ask(readLineInterface, 'Are there steps missing that you want to include (i.e. 1. Install xyz) ? List them or leave it blank: ');
+            console.log('');
 
             if (stepsToExclude) {
                 const requirementsWithExcludedSteps = await getChatCompletion([{ role: 'user', content: 'I have this list of steps:\n' + requirements + '\n\nI want you to remove these steps: ' + stepsToExclude }]);
@@ -360,7 +342,7 @@ async function main() {
             }
 
             // Starting project...
-            addMessage('user', projectDescription + '\n' + requirements + '\n' + commander);
+            addMessage('user', projectDescription + '\n' + requirements + '\n');
 
             setSessionAction('Ready.', sessionContext);
 
@@ -373,7 +355,7 @@ async function main() {
             const projectFile = files[files.length - 1];
             sessionId = Number(projectFile.split('-')[1].replace('.log', ''));
             const lastStateOfProject = JSON.parse(readFileSync(path.join(directoryPath, projectFile), 'utf-8'));
-            const lastMessages = lastStateOfProject[lastStateOfProject.length - 1].messages;
+            const lastMessages = lastStateOfProject[lastStateOfProject.length - 1]?.messages || [];
             messages = lastMessages;
 
             const newInstruction = await ask(readLineInterface, 'New instruction? (leave blank if none) ');
@@ -388,11 +370,12 @@ async function main() {
         }
 
         while (true) {
+            writeFileSync(sessionPath, JSON.stringify(session, null, 4));
+
             await createChatCompletion(messages);
 
             session.push({ date: new Date().getTime(), messages });
-            writeFileSync(allWorkspacesDirectory + '/' + workspaceName + '-' + sessionId + '.log', JSON.stringify(session, null, 4));
-            await ask(readLineInterface, 'Pause...');
+            // await ask(readLineInterface, 'Pause...');
 
             // For now, slow start, so that CLI have time to create files
             await messages.length < 4 ? sleep(15000) : sleep(3000);
@@ -401,7 +384,6 @@ async function main() {
         console.log(err);
         console.log(err?.response?.data?.error);
     }
-
 }
 
 main();
